@@ -2,14 +2,17 @@
 #=================================================
 # honk 离线安装器（OpenWrt / iStoreOS 25.12 · apk）
 #
-# payload 里只放 iStoreOS 官方源没有的包：
+# 设计前提：本包不添加任何软件源、不在设备上留任何源或密钥。
+# payload 里只放 iStoreOS / OpenWrt 官方源没有的包：
 #   apks/honk-*.apk
 #   apks/luci-app-honk-*.apk
 #   apks/luci-lib-daeuniverse-*.apk
 #   apks/luci-i18n-daeuniverse-zh-cn-*.apk
 #   apks/vmlinux-btf-builtin-*.apk
-#   keys/daeuniverse.pem
 # 其余依赖（kmod-*、libstdcpp6、v2ray-geoip/geosite、luci-base…）全部由设备自己的源提供。
+#
+# 安装用的是本地 apk 文件，加 --allow-untrusted 是因为发布方密钥不在设备上；
+# 校验强度由两层保证：makeself 的 MD5 归档校验 + 本脚本的 sha256sum -c。
 #=================================================
 set -u
 
@@ -57,8 +60,8 @@ fi
 
 say "固件 ${RELEASE:-未知} · 架构 $ARCH · 内核 $KREL"
 
-# ---------- 2. 冲突预检（只警告，不改任何服务状态） ----------
-step "冲突预检"
+# ---------- 2. 冲突与污染预检（只读，不改任何状态） ----------
+step "冲突与源预检"
 
 if [ -x /etc/init.d/dae ]; then
 	_dae_en="$(uci -q get dae.config.enabled 2>/dev/null)"
@@ -73,6 +76,17 @@ if [ -x /etc/init.d/openclash ]; then
 	warn "检测到 OpenClash：tproxy/redirect 规则与 honk 的 eBPF 数据面会冲突，启用 honk 前请先停用并确认规则已撤净"
 fi
 
+# 本包不写任何源；但设备上若残留第三方源，apk add 时它会参与解析，
+# 会让"装成功"这件事变得不可解释，所以这里只提示不改。
+for _f in /etc/apk/repositories.d/*.list /etc/apk/repositories; do
+	[ -f "$_f" ] || continue
+	if grep -q daeuniverse "$_f" 2>/dev/null; then
+		warn "检测到第三方源残留：$_f 里有 daeuniverse"
+		warn "  本包不会使用、也不会修改它。但它会参与 apk 的解析，建议先清掉再装："
+		warn "    rm -f $_f && apk update"
+	fi
+done
+
 # ---------- 3. 完整性校验 ----------
 step "校验 payload"
 
@@ -86,30 +100,18 @@ fi
 
 ls apks/*.apk >/dev/null 2>&1 || die "payload 里没有 apk"
 
-# ---------- 4. 导入打包签名公钥 ----------
-# 目的是让下面 apk add 走正常验签，而不是一上来就 --allow-untrusted
-step "导入签名公钥"
-
-mkdir -p /etc/apk/keys || die "无法创建 /etc/apk/keys"
-if [ -s /etc/apk/keys/daeuniverse.pem ]; then
-	say "公钥已存在"
-else
-	cp keys/daeuniverse.pem /etc/apk/keys/daeuniverse.pem || die "复制公钥失败"
-	say "已写入 /etc/apk/keys/daeuniverse.pem"
-fi
-
-# ---------- 5. 刷新索引（依赖仍来自设备自己的源） ----------
+# ---------- 4. 刷新索引（依赖仍来自设备自己的源） ----------
 step "apk update"
 
-apk update || die "apk update 失败：依赖需要从本机源解析，先解决源的问题再重试"
+apk update || die "apk update 失败：其余依赖需要从本机源解析，先解决源的问题再重试"
 
-# ---------- 6. 依赖预演（不落盘） ----------
+# ---------- 5. 依赖预演（不落盘） ----------
 step "依赖预演"
 
 # --simulate 走完整依赖图，能认出 provides（25.12 的 libstdcpp 实为 libstdcpp6）
 # 以及 kmod 与内核 ABI 的绑定；按包名 apk list 查会误判成缺依赖
 # shellcheck disable=SC2086
-SIM_OUT="$(apk add --simulate ./apks/*.apk 2>&1)"
+SIM_OUT="$(apk add --simulate --allow-untrusted ./apks/*.apk 2>&1)"
 SIM_RC=$?
 if [ "$SIM_RC" != "0" ]; then
 	case "$SIM_OUT" in
@@ -131,31 +133,23 @@ else
 	say "依赖全部可解析"
 fi
 
-# ---------- 7. 安装 ----------
+# ---------- 6. 安装 ----------
 step "安装 honk / luci-app-honk / 中文语言包"
 
+# --allow-untrusted 只作用于本 payload 里的本地文件：
+# 设备上没有发布方密钥，而本包又刻意不往 /etc/apk/keys 放任何东西。
+# payload 完整性由 makeself 的 MD5 与上面的 sha256sum -c 保证。
 # shellcheck disable=SC2086
-if ! OUT="$(apk add ./apks/*.apk 2>&1)"; then
-	case "$OUT" in
-		*UNTRUSTED*|*untrusted*)
-			# payload 已过 SHA256 校验，签名只是发布方的密钥本机不认；这一点与 kenzok8
-			# 官方安装脚本的取舍一致，明确告知后放宽这一次
-			warn "包签名本机不认（发布方密钥），已通过 SHA256 校验，改用 --allow-untrusted 重试"
-			# shellcheck disable=SC2086
-			apk add --allow-untrusted ./apks/*.apk || die "安装失败（原始报错见上）"
-			;;
-		*)
-			printf '%s\n' "$OUT" | sed 's/^/    /' >&2
-			die "apk add 失败：看上面原始报错。kmod 类多半是与内核不同源，非 kmod 类多半是源缺包"
-			;;
-	esac
+if ! OUT="$(apk add --allow-untrusted ./apks/*.apk 2>&1)"; then
+	printf '%s\n' "$OUT" | sed 's/^/    /' >&2
+	die "apk add 失败：看上面原始报错。kmod 类多半是与内核不同源，非 kmod 类多半是源缺包"
 fi
 
-# ---------- 8. 只读校验 ----------
+# ---------- 7. 只读校验 ----------
 step "校验"
 
 _missing=""
-for _p in honk luci-app-honk; do
+for _p in honk luci-app-honk luci-lib-daeuniverse luci-i18n-daeuniverse-zh-cn; do
 	apk info -e "$_p" >/dev/null 2>&1 || _missing="$_missing $_p"
 done
 [ -z "$_missing" ] || die "安装后未找到包：$_missing"
@@ -166,9 +160,10 @@ else
 	warn "/usr/bin/honk-core 不存在，安装结果异常"
 fi
 
-# ---------- 9. 收尾提示（不自动启动、不改配置） ----------
+# ---------- 8. 收尾提示（不自动启动、不改配置） ----------
 say ""
-say "安装完成。以下动作本脚本不会自动做："
+say "安装完成。本包没有添加任何软件源，也没有往 /etc/apk/keys 放密钥。"
+say "以下动作本脚本不会自动做："
 say "  1) 编辑 /etc/honk/config.dae：默认 LAN 接口写的是 br-lan，网桥名不同必须先改"
 say "  2) 打开 doona：http://<路由器IP>:9527/ —— 必须用 IP，honk 拒绝 openwrt.lan 这类主机名"
 say "  3) 在 LuCI（服务 → honk）打开 Start at boot，或："
@@ -176,5 +171,5 @@ say "       uci set honk.config.enabled=1 && uci commit honk && /etc/init.d/honk
 say "  4) 同机还有 dae / OpenClash 在跑的话，先停干净再启动 honk"
 say ""
 say "卸载：apk del honk luci-app-honk luci-lib-daeuniverse luci-i18n-daeuniverse-zh-cn vmlinux-btf-builtin"
-say "      /etc/honk/data/ 与 /etc/apk/keys/daeuniverse.pem 不随 apk del 删除，需要自己删"
+say "      /etc/honk/（含 data/）不随 apk del 删除，需要自己清"
 exit 0
