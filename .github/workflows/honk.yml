@@ -1,0 +1,115 @@
+#=================================================
+# honk 离线安装包（manual dispatch，按架构生成）
+#
+# 只把 iStoreOS / OpenWrt 官方源里没有的包打进 run：
+#   honk、luci-app-honk、luci-lib-daeuniverse、luci-i18n-daeuniverse-zh-cn、
+#   vmlinux-btf-builtin，外加发布方公钥。
+# kmod-*、libstdcpp6、v2ray-geoip/geosite、luci-base 等全部由设备自己的源解析。
+#=================================================
+
+name: Make honk offline run
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "目标架构（必须等于路由器 DISTRIB_ARCH）"
+        required: true
+        default: aarch64_generic
+        type: choice
+        options:
+          - aarch64_generic
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - aarch64_cortex-a76
+          - x86_64
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    env:
+      SUITE: "25.12"
+      FEED: "https://openwrt.daeuniverse.org"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Clone makeself repository
+        run: git clone --depth 1 https://github.com/megastep/makeself.git
+
+      - name: Fetch packages from daeuniverse feed
+        run: |
+          set -eu
+          ARCH="${{ inputs.arch }}"
+          BASE="$FEED/$SUITE/packages/$ARCH"
+          mkdir -p staging/apks staging/keys
+
+          echo "→ $BASE/"
+          curl -fsSL "$BASE/" -o listing.html
+
+          # 只取 feed 里那份 honk 和它的配套包，按文件名前缀精确匹配
+          for pat in '^honk-' '^luci-app-honk-' '^luci-lib-daeuniverse-' '^luci-i18n-daeuniverse-zh-cn-' '^vmlinux-btf-builtin-'; do
+            name=$(grep -oE 'href="[^"]+\.apk"' listing.html | sed 's/^href="//; s/"$//' | grep -E "$pat" | head -n1 || true)
+            if [ -z "$name" ]; then
+              echo "❌ feed 里找不到匹配 $pat 的包（$ARCH）" >&2
+              exit 1
+            fi
+            echo "   ↓ $name"
+            curl -fsSL "$BASE/$name" -o "staging/apks/$name"
+          done
+
+          curl -fsSL "$FEED/public-key.pem" -o staging/keys/daeuniverse.pem
+
+          echo "$ARCH" > staging/ARCH
+          cp shell/honk-install.sh staging/install.sh
+          chmod +x staging/install.sh
+
+          cd staging
+          sha256sum apks/*.apk keys/daeuniverse.pem > SHA256SUMS
+          cat SHA256SUMS
+
+          # 目标机是 BusyBox ash，先做语法检查
+          sudo apt-get install -y --no-install-recommends busybox >/dev/null 2>&1 || true
+          busybox sh -n install.sh
+
+          du -sh apks
+
+      - name: Create self-extracting package
+        run: |
+          set -eu
+          ARCH="${{ inputs.arch }}"
+          VER=$(ls staging/apks/honk-*.apk | sed 's#.*/honk-##; s#-r[0-9]*\.apk$##')
+          echo "honk version: $VER"
+          cd makeself
+          ./makeself.sh --nox11 ../staging "honk-offline-${VER}-${ARCH}.run" "honk offline installer" ./install.sh
+          ls -lh ./*.run
+          echo "RUN_NAME=honk-offline-${VER}-${ARCH}.run" >> "$GITHUB_ENV"
+
+      - name: Set tag name
+        run: |
+          TODAY=$(TZ="Asia/Shanghai" date +'%Y-%m-%d')
+          echo "tag_name=$TODAY" >> "$GITHUB_ENV"
+
+      - name: Upload run file as release assets
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.tag_name }}
+          name: "honk ${{ env.tag_name }}"
+          files: makeself/*.run
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            honk 离线安装包 · 架构 `${{ inputs.arch }}` · feed 套件 `25.12`
+
+            ```sh
+            wget -O honk.run <本页附件地址>
+            sh honk.run
+            ```
+
+            只打包了官方源里没有的包（honk / luci-app-honk / luci-lib-daeuniverse /
+            luci-i18n-daeuniverse-zh-cn / vmlinux-btf-builtin），kmod 与数据包仍走设备本地源。
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
