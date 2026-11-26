@@ -46,7 +46,7 @@ jobs:
           set -eu
           ARCH="${{ inputs.arch }}"
           BASE="$FEED/$SUITE/packages/$ARCH"
-          mkdir -p staging/apks staging/keys
+          mkdir -p staging/apks
 
           echo "→ $BASE/"
           curl -fsSL "$BASE/" -o listing.html
@@ -62,14 +62,12 @@ jobs:
             curl -fsSL "$BASE/$name" -o "staging/apks/$name"
           done
 
-          curl -fsSL "$FEED/public-key.pem" -o staging/keys/daeuniverse.pem
-
           echo "$ARCH" > staging/ARCH
           cp shell/honk-install.sh staging/install.sh
           chmod +x staging/install.sh
 
           cd staging
-          sha256sum apks/*.apk keys/daeuniverse.pem > SHA256SUMS
+          sha256sum apks/*.apk > SHA256SUMS
           cat SHA256SUMS
 
           # 目标机是 BusyBox ash，先做语法检查
